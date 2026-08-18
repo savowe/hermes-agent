@@ -2,7 +2,8 @@
 
 Covers:
 - BraveFreeWebSearchProvider.is_available() env var gating
-- BraveFreeWebSearchProvider.search() — happy path, HTTP error, request error, bad JSON
+- BraveFreeWebSearchProvider.search() — happy path, HTTP error, 429 retry,
+  request error, bad JSON
 - Result normalization (title, url, description, position)
 - Limit truncation + Brave's count cap (20)
 - _is_backend_available("brave-free") integration
@@ -15,6 +16,7 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from tests.tools.conftest import register_all_web_providers
@@ -90,6 +92,53 @@ class TestBraveFreeProviderSearch:
         assert captured["headers"].get("X-Subscription-Token") == "BSAkey123"
         assert captured["params"].get("q") == "q"
         assert captured["params"].get("count") == 5
+
+    def test_retries_rate_limit_after_retry_after_delay(self, monkeypatch):
+        monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
+        from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
+
+        request = httpx.Request("GET", "https://example.com")
+        rate_limited = httpx.Response(
+            429,
+            headers={"Retry-After": "2"},
+            request=request,
+        )
+        success = httpx.Response(
+            200,
+            json=self._SAMPLE_RESPONSE,
+            request=request,
+        )
+
+        with (
+            patch("httpx.get", side_effect=[rate_limited, success]) as mock_get,
+            patch("plugins.web.brave_free.provider.time.sleep") as mock_sleep,
+        ):
+            result = BraveFreeWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is True
+        assert mock_get.call_count == 2
+        mock_sleep.assert_called_once_with(2.0)
+
+    def test_retries_rate_limit_with_exponential_fallback(self, monkeypatch):
+        monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
+        from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
+
+        request = httpx.Request("GET", "https://example.com")
+        rate_limited = httpx.Response(429, request=request)
+        success = httpx.Response(
+            200,
+            json=self._SAMPLE_RESPONSE,
+            request=request,
+        )
+
+        with (
+            patch("httpx.get", side_effect=[rate_limited, success]),
+            patch("plugins.web.brave_free.provider.time.sleep") as mock_sleep,
+        ):
+            result = BraveFreeWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is True
+        mock_sleep.assert_called_once_with(1.0)
 
 
     def test_missing_web_key_returns_empty(self, monkeypatch):

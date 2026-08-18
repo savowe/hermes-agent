@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Dict
 
 from agent.web_search_provider import WebSearchProvider
@@ -28,6 +29,31 @@ from agent.web_search_provider import WebSearchProvider
 logger = logging.getLogger(__name__)
 
 _BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+_BRAVE_MAX_ATTEMPTS = 3
+_BRAVE_DEFAULT_RETRY_DELAY = 1.0
+_BRAVE_MAX_RETRY_DELAY = 30.0
+
+
+def _brave_retry_delay(response: Any, retry_number: int) -> float:
+    """Return the delay before a retry after a Brave 429 response.
+
+    Brave may provide ``Retry-After`` as a number of seconds. If it is absent
+    or malformed, use a short exponential backoff suitable for the free tier's
+    one-request-per-second limit, while keeping the wait bounded.
+    """
+    try:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is not None:
+            delay = float(retry_after)
+            if delay >= 0:
+                return min(delay, _BRAVE_MAX_RETRY_DELAY)
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+    return min(
+        _BRAVE_DEFAULT_RETRY_DELAY * (2**retry_number),
+        _BRAVE_MAX_RETRY_DELAY,
+    )
 
 
 class BraveFreeWebSearchProvider(WebSearchProvider):
@@ -76,32 +102,56 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
         # Brave's `count` is capped at 20.
         count = max(1, min(int(limit), 20))
 
-        try:
-            resp = httpx.get(
-                _BRAVE_ENDPOINT,
-                params={"q": query, "count": count},
-                headers={
-                    "X-Subscription-Token": api_key,
-                    "Accept": "application/json",
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            logger.warning("Brave Search HTTP error: %s", exc)
-            return {
-                "success": False,
-                "error": f"Brave Search returned HTTP {exc.response.status_code}",
-            }
-        except httpx.RequestError as exc:
-            logger.warning("Brave Search request error: %s", exc)
-            return {"success": False, "error": f"Could not reach Brave Search: {exc}"}
+        resp = None
+        for attempt in range(_BRAVE_MAX_ATTEMPTS):
+            try:
+                resp = httpx.get(
+                    _BRAVE_ENDPOINT,
+                    params={"q": query, "count": count},
+                    headers={
+                        "X-Subscription-Token": api_key,
+                        "Accept": "application/json",
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                break
+            except httpx.HTTPStatusError as exc:
+                status_code = (
+                    exc.response.status_code if exc.response is not None else 0
+                )
+                if status_code == 429 and attempt < _BRAVE_MAX_ATTEMPTS - 1:
+                    delay = _brave_retry_delay(exc.response, attempt)
+                    logger.warning(
+                        "Brave Search rate limited (429); retrying in %.1f seconds "
+                        "(attempt %d/%d)",
+                        delay,
+                        attempt + 1,
+                        _BRAVE_MAX_ATTEMPTS - 1,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                logger.warning("Brave Search HTTP error: %s", exc)
+                return {
+                    "success": False,
+                    "error": f"Brave Search returned HTTP {status_code}",
+                }
+            except httpx.RequestError as exc:
+                logger.warning("Brave Search request error: %s", exc)
+                return {
+                    "success": False,
+                    "error": f"Could not reach Brave Search: {exc}",
+                }
 
         try:
             data = resp.json()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Brave Search response parse error: %s", exc)
-            return {"success": False, "error": "Could not parse Brave Search response as JSON"}
+            return {
+                "success": False,
+                "error": "Could not parse Brave Search response as JSON",
+            }
 
         raw_results = (data.get("web") or {}).get("results", []) or []
         truncated = raw_results[:limit]
