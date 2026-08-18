@@ -27,6 +27,13 @@ _SAMPLE_CATALOG = [
         },
     },
     {
+        "id": "gpt-5.6-luna",
+        "capabilities": {
+            "type": "chat",
+            "limits": {"max_prompt_tokens": 200000, "max_output_tokens": 128000},
+        },
+    },
+    {
         "id": "claude-sonnet-4",
         "capabilities": {
             "type": "chat",
@@ -66,6 +73,54 @@ class TestGetCopilotModelContext:
     def test_returns_max_prompt_tokens(self, mock_fetch):
         assert get_copilot_model_context("claude-opus-4.6-1m") == 1_000_000
         assert get_copilot_model_context("gpt-4.1") == 128_000
+        # The Copilot catalog is stale for this account/model; use the
+        # narrowly scoped live-verified correction.
+        assert get_copilot_model_context("gpt-5.6-luna") == 900_000
+
+    @patch(
+        "hermes_cli.models.fetch_github_model_catalog",
+        return_value=[
+            {
+                "id": "gpt-5.6-luna",
+                "capabilities": {
+                    "limits": {"max_prompt_tokens": 1_000_000},
+                },
+            }
+        ],
+    )
+    def test_catalog_correction_is_inert_when_github_updates_value(self, mock_fetch):
+        assert get_copilot_model_context("gpt-5.6-luna") == 1_000_000
+
+    @patch(
+        "hermes_cli.models.fetch_github_model_catalog",
+        return_value=[
+            {
+                "id": "gpt-5.6-sol",
+                "capabilities": {"limits": {"max_prompt_tokens": 272_000}},
+            },
+            {
+                "id": "gpt-5.6-terra",
+                "capabilities": {"limits": {"max_prompt_tokens": 272_000}},
+            },
+        ],
+    )
+    def test_correction_covers_the_gpt_5_6_family(self, mock_fetch):
+        assert get_copilot_model_context("gpt-5.6-sol") == 900_000
+        assert get_copilot_model_context("gpt-5.6-terra") == 900_000
+
+    @patch(
+        "hermes_cli.models.fetch_github_model_catalog",
+        return_value=[
+            {
+                "id": "gpt-5.5",
+                "capabilities": {
+                    "limits": {"max_prompt_tokens": 200_000},
+                },
+            }
+        ],
+    )
+    def test_correction_does_not_leak_to_other_models(self, mock_fetch):
+        assert get_copilot_model_context("gpt-5.5") == 200_000
 
 
     @patch("hermes_cli.models.fetch_github_model_catalog", return_value=_SAMPLE_CATALOG)

@@ -4701,6 +4701,32 @@ _copilot_context_cache: dict[str, int] = {}
 _copilot_context_cache_time: float = 0.0
 _COPILOT_CONTEXT_CACHE_TTL = 3600  # 1 hour
 
+# GitHub Copilot's /models catalog can lag behind the actual Responses
+# enforcement for GPT-5.6.  Live probes with the Copilot credential used by
+# Hermes accepted 900K input tokens for the GPT-5.6 family while the catalog
+# still advertised below 900K. Keep this narrowly scoped to this model family;
+# if GitHub publishes 900K or more, its live value wins automatically.
+_COPILOT_VERIFIED_CONTEXT_OVERRIDES: dict[str, int] = {
+    "gpt-5.6-sol": 900_000,
+    "gpt-5.6-terra": 900_000,
+    "gpt-5.6-luna": 900_000,
+}
+
+
+def _copilot_context_for_catalog_value(model_id: str, advertised: int) -> int:
+    """Apply only a live-verified Copilot stale-catalog correction."""
+    model_key = (model_id or "").strip().lower()
+    verified = _COPILOT_VERIFIED_CONTEXT_OVERRIDES.get(model_key)
+    if verified is not None and advertised < verified:
+        logger.debug(
+            "Copilot context for %s: catalog advertises %d; using live-verified %d",
+            model_id,
+            advertised,
+            verified,
+        )
+        return verified
+    return advertised
+
 
 def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> Optional[int]:
     """Look up max_prompt_tokens for a Copilot model from the live /models API.
@@ -4731,7 +4757,7 @@ def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> O
         limits = caps.get("limits") or {}
         max_prompt = limits.get("max_prompt_tokens")
         if isinstance(max_prompt, int) and max_prompt > 0:
-            cache[mid] = max_prompt
+            cache[mid] = _copilot_context_for_catalog_value(mid, max_prompt)
 
     _copilot_context_cache = cache
     _copilot_context_cache_time = time.time()
