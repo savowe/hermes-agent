@@ -258,6 +258,27 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
     except (subprocess.CalledProcessError, OSError):
         return None
 
+
+def _abort_diverged_update(branch: str, cwd: Path, pull_result) -> None:
+    """Abort safely when the target branch cannot be fast-forwarded.
+
+    A local commit is user-owned state. Never replace it with the remote tip
+    just because ``merge --ff-only`` failed; require an explicit merge so any
+    conflicts are visible and resolved by the user.
+    """
+    checkout = shlex.quote(str(cwd))
+    print(
+        f"✗ Automatic update aborted: local and origin/{branch} history diverged."
+    )
+    print("  No local commits were changed or deleted.")
+    print("  Resolve the merge manually:")
+    print(f"    git -C {checkout} fetch origin")
+    print(f"    git -C {checkout} merge origin/{branch}")
+    print("  Resolve conflicts if Git reports any, then re-run: hermes update")
+    if getattr(pull_result, "stderr", "").strip():
+        print(f"  Git: {pull_result.stderr.strip().splitlines()[0]}")
+    raise SystemExit(1)
+
 # Files that define the editable install. A pull that touches none of them
 # cannot have invalidated it.
 _INSTALL_DEFINING_FILES = (
@@ -5765,8 +5786,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # instead of `git pull`, which performs a SECOND network fetch of
             # the same branch (~0.5-1.5 s of redundant round-trip per update).
             # `merge --ff-only origin/<branch>` is byte-identical in effect to
-            # `pull --ff-only origin <branch>` given the fresh tracking ref;
-            # the divergence fallback below is unchanged.
+            # `pull --ff-only origin <branch>` given the fresh tracking ref.
             pull_result = subprocess.run(
                 git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
                 cwd=_m().PROJECT_ROOT,
@@ -5774,26 +5794,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                # A failed fast-forward means that an explicit merge or rebase
+                # is required. Never discard local commits with reset --hard.
+                _abort_diverged_update(
+                    branch,
+                    _m().PROJECT_ROOT,
+                    pull_result,
                 )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                    )
-                    sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
