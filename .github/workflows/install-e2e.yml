@@ -63,11 +63,15 @@ jobs:
     outputs:
       tags: ${{ steps.pick.outputs.tags }}
     steps:
-      # This job only reads tag names and runs one script, so take the cheap
-      # checkout: no blobs (filter), no other files (sparse), but DO fetch tags
-      # -- they are the whole input, and the default shallow checkout has none.
+      # Release tags are published on the official repository. Forks may have
+      # no copied tag refs, so read the tag list from upstream rather than
+      # treating an empty fork tag namespace as "no releases". The sandbox
+      # legs already fetch their starting refs from this same upstream URL.
+      # This job only reads tag names and runs one script, so keep the cheap
+      # checkout: no blobs (filter), no other files (sparse), but DO fetch tags.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          repository: NousResearch/hermes-agent
           filter: blob:none
           fetch-tags: true
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
