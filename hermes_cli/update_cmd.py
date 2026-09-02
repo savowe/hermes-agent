@@ -2857,11 +2857,70 @@ def _sync_with_upstream_if_needed(
     print("→ Pulling from upstream...")
 
     try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
+        current_branch_result = subprocess.run(
+            git_cmd + ["branch", "--show-current"],
             cwd=cwd,
-            check=True,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
         )
+        current_branch = (current_branch_result.stdout or "").strip()
+
+        if current_branch == "main":
+            # On main, a normal fast-forward pull updates both the checked-out
+            # tree and the local main ref.
+            update_result = subprocess.run(
+                git_cmd + ["pull", "--ff-only", "upstream", "main"],
+                cwd=cwd,
+                check=True,
+            )
+        else:
+            # A maintained custom branch may be checked out here. Do not run
+            # `git pull upstream main` in that worktree: even --ff-only would
+            # target the custom branch and either fail or merge upstream into
+            # the wrong ref. Advance only the local main ref, then push that
+            # clean mirror to origin.
+            local_main = subprocess.run(
+                git_cmd + ["rev-parse", "--verify", "refs/heads/main"],
+                cwd=cwd,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            origin_main = subprocess.run(
+                git_cmd + ["rev-parse", "--verify", "refs/remotes/origin/main"],
+                cwd=cwd,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            local_main_sha = (local_main.stdout or "").strip()
+            origin_main_sha = (origin_main.stdout or "").strip()
+            if (
+                local_main.returncode != 0
+                or origin_main.returncode != 0
+                or not local_main_sha
+                or local_main_sha != origin_main_sha
+            ):
+                print(
+                    "  ✗ Cannot sync fork main while a custom branch is checked out: "
+                    "local main is not an exact mirror of origin/main."
+                )
+                print("    Switch to main once to reconcile the fork refs, then retry.")
+                return False
+
+            update_result = subprocess.run(
+                git_cmd
+                + [
+                    "update-ref",
+                    "refs/heads/main",
+                    "refs/remotes/upstream/main",
+                    local_main_sha,
+                ],
+                cwd=cwd,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            if update_result.returncode != 0:
+                print("  ✗ Failed to advance the local main ref from upstream.")
+                return False
     except subprocess.CalledProcessError:
         print(
             "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
@@ -2874,6 +2933,15 @@ def _sync_with_upstream_if_needed(
     print("→ Syncing fork...")
     if _sync_fork_with_upstream(git_cmd, cwd):
         print("  ✓ Fork synced with upstream")
+        if current_branch != "main":
+            # Refresh the remote-tracking ref so the same update invocation
+            # can merge the newly synced main into the checked-out branch.
+            subprocess.run(
+                git_cmd + ["fetch", "origin", "main", "--quiet"],
+                cwd=cwd,
+                capture_output=True,
+                check=False,
+            )
     else:
         print(
             "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
@@ -7911,6 +7979,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # HEAD moving is itself proof of an update. Keep the update
                 # path active even if the informational count cannot be read.
                 commit_count = max(1, synced_count)
+            elif upstream_checked:
+                # When a custom branch is checked out, fork sync advances only
+                # refs/heads/main, so HEAD intentionally does not move. Re-read
+                # the target distance to let this same invocation merge the
+                # refreshed origin/main into the custom branch.
+                refreshed_count = _count_commits_between(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    "HEAD",
+                    f"origin/{branch}",
+                )
+                if refreshed_count > 0:
+                    commit_count = refreshed_count
 
         if commit_count == 0:
             _invalidate_update_cache()
